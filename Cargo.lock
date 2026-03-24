@@ -544,6 +544,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "plum-rs"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs-next",
+ "git2",
+ "glob",
+ "serde",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "ureq",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -585,21 +600,6 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.64",
-]
-
-[[package]]
-name = "rime-install"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "clap",
- "dirs-next",
- "git2",
- "glob",
- "serde",
- "serde_yaml",
- "thiserror 2.0.18",
- "ureq",
 ]
 
 [[package]]

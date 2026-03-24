@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// 加载 packages.conf 文件，返回包列表
 /// 格式：package_list=(luna-pinyin terra-pinyin ...)

@@ -142,10 +142,7 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
     } else {
         // 短名：归属 rime 组织
         let proj = pkg_part.to_string();
-        let r = proj
-            .strip_prefix("rime-")
-            .unwrap_or(&proj)
-            .to_string();
+        let r = proj.strip_prefix("rime-").unwrap_or(&proj).to_string();
         ("rime".to_string(), r, proj)
     };
 
@@ -175,11 +172,7 @@ fn parse_options(s: &str) -> Vec<(String, String)> {
             let mut it = kv.splitn(2, '=');
             let k = it.next()?.trim().to_string();
             let v = it.next().unwrap_or("").trim().to_string();
-            if k.is_empty() {
-                None
-            } else {
-                Some((k, v))
-            }
+            if k.is_empty() { None } else { Some((k, v)) }
         })
         .collect()
 }

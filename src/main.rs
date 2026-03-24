@@ -4,10 +4,10 @@ mod frontend;
 mod recipe;
 mod target;
 
-use anyhow::{bail, Context, Result};
-use clap::Parser;
+use anyhow::{Context, Result, bail};
+use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
-use target::{parse_target, Target};
+use target::{Target, parse_target};
 
 /// Rime 配置管理器
 ///
@@ -20,26 +20,49 @@ use target::{parse_target, Target};
 ///   lotem/rime-forge/lotem-packages.conf      # 远程包列表
 ///   :preset / :extra / :all                   # 内置配置集
 #[derive(Parser, Debug)]
-#[command(name = "rime-install", version, about)]
+#[command(
+    name = "rime-install",
+    version,
+    about = "Rime 配置管理器",
+    help_template = "\
+{about}
+
+用法: {usage}
+
+参数:
+{positionals}
+
+选项:
+{options}
+"
+)]
 struct Cli {
     /// Rime 用户目录，不指定则自动探测
-    #[arg(long, env = "rime_dir")]
+    #[arg(long, env = "RIME_DIR")]
     rime_dir: Option<PathBuf>,
 
-    /// plum 工作目录（存放下载的包）
-    #[arg(long, env = "plum_dir", default_value = "plum")]
+    /// Plum 工作目录（存放下载的包）
+    #[arg(long, env = "PLUM_DIR", default_value = "plum")]
     plum_dir: PathBuf,
 
     /// 跳过已有包的更新
     #[arg(long)]
     no_update: bool,
 
-    /// 要安装的 target，不指定则默认 :preset
+    /// 要安装的 target，示例：luna-pinyin
     targets: Vec<String>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 如果没有 target，直接打印帮助并退出
+    if cli.targets.is_empty() {
+        println!("请指定要安装的 target。\n");
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
 
     let rime_dir = match cli.rime_dir {
         Some(d) => d,
@@ -49,11 +72,7 @@ fn main() -> Result<()> {
 
     println!("Rime 用户目录: {}", rime_dir.display());
 
-    let targets = if cli.targets.is_empty() {
-        vec![":preset".to_string()]
-    } else {
-        cli.targets.clone()
-    };
+    let targets = cli.targets.clone();
 
     let mut total_files = 0usize;
     let mut total_packages = 0usize;
@@ -151,11 +170,7 @@ fn install_package(
         Some(f)
     } else {
         let f = package_dir.join("recipe.yaml");
-        if f.exists() {
-            Some(f)
-        } else {
-            None
-        }
+        if f.exists() { Some(f) } else { None }
     };
 
     if let Some(rf) = recipe_file {

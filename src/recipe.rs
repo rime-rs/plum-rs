@@ -130,8 +130,9 @@ fn install_files(files: &[String], package_dir: &Path, output_dir: &Path) -> Res
                     println!("安装: {}", rel_path.display());
                 }
 
-                std::fs::copy(&entry, &dst)
-                    .with_context(|| format!("复制文件失败: {} -> {}", entry.display(), dst.display()))?;
+                std::fs::copy(&entry, &dst).with_context(|| {
+                    format!("复制文件失败: {} -> {}", entry.display(), dst.display())
+                })?;
                 count += 1;
             }
         }
