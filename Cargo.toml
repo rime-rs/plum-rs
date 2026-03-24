@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 license = "LGPL-3.0-or-later"
-name = "rime-install"
+name = "plum-rs"
 version = "0.1.1"
 
 [[bin]]
