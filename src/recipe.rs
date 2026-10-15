@@ -67,13 +67,11 @@ fn collect_default_files(package_dir: &Path) -> Result<Vec<String>> {
     for entry in std::fs::read_dir(package_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".yaml")
+        let is_config = name.ends_with(".yaml")
             && !name.ends_with(".custom.yaml")
             && !name.ends_with(".recipe.yaml")
-            && name != "recipe.yaml"
-        {
-            files.push(name);
-        } else if name.ends_with(".txt") || name.ends_with(".gram") {
+            && name != "recipe.yaml";
+        if is_config || name.ends_with(".txt") || name.ends_with(".gram") {
             files.push(name);
         }
     }

@@ -6,7 +6,7 @@ mod target;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use target::{Target, parse_target};
 
 /// Rime 配置管理器
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_target(t: Target, plum_dir: &PathBuf) -> Result<Vec<target::PackageRef>> {
+fn resolve_target(t: Target, plum_dir: &Path) -> Result<Vec<target::PackageRef>> {
     match t {
         Target::Package(p) => Ok(vec![p]),
 
@@ -159,8 +159,8 @@ fn parse_package_list(content: &str) -> Result<Vec<target::PackageRef>> {
 
 fn install_package(
     pkg: &target::PackageRef,
-    package_dir: &PathBuf,
-    output_dir: &PathBuf,
+    package_dir: &Path,
+    output_dir: &Path,
 ) -> Result<usize> {
     let recipe_file = if let Some(r) = &pkg.recipe {
         let f = package_dir.join(format!("{}.recipe.yaml", r));
@@ -180,18 +180,16 @@ fn install_package(
     }
 }
 
-fn install_default_files(package_dir: &PathBuf, output_dir: &PathBuf) -> Result<usize> {
+fn install_default_files(package_dir: &Path, output_dir: &Path) -> Result<usize> {
     let mut files = vec![];
     for entry in std::fs::read_dir(package_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".yaml")
+        let is_config = name.ends_with(".yaml")
             && !name.ends_with(".custom.yaml")
             && !name.ends_with(".recipe.yaml")
-            && name != "recipe.yaml"
-        {
-            files.push(name);
-        } else if name.ends_with(".txt") || name.ends_with(".gram") {
+            && name != "recipe.yaml";
+        if is_config || name.ends_with(".txt") || name.ends_with(".gram") {
             files.push(name);
         }
     }

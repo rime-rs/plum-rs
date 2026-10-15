@@ -122,13 +122,9 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
     let options = parse_options(opts_str);
 
     // 解析 <pkg>[@branch]
-    let (pkg_part, branch) = if pkg_and_branch.contains('@') {
-        let mut it = pkg_and_branch.splitn(2, '@');
-        let p = it.next().unwrap();
-        let b = it.next().unwrap();
-        (p, Some(b.to_string()))
-    } else {
-        (pkg_and_branch, None)
+    let (pkg_part, branch) = match pkg_and_branch.split_once('@') {
+        Some((p, b)) => (p, Some(b.to_string())),
+        None => (pkg_and_branch, None),
     };
 
     // 解析 user/repo 或 shortname
@@ -156,11 +152,8 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
     })
 }
 
-fn split_once_or<'a>(s: &'a str, delim: char) -> (&'a str, &'a str) {
-    match s.find(delim) {
-        Some(i) => (&s[..i], &s[i + 1..]),
-        None => (s, ""),
-    }
+fn split_once_or(s: &str, delim: char) -> (&str, &str) {
+    s.split_once(delim).unwrap_or((s, ""))
 }
 
 fn parse_options(s: &str) -> Vec<(String, String)> {
