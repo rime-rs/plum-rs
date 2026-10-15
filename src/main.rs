@@ -1,230 +1,154 @@
+mod archive;
 mod conf;
 mod fetch;
+mod files;
 mod frontend;
 mod recipe;
 mod target;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser};
-use std::path::{Path, PathBuf};
+use clap::Parser;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+};
 use target::{Target, parse_target};
 
 /// Rime 配置管理器
-///
-/// target 格式：
-///   luna-pinyin                               # 短名，归属 rime 组织
-///   lotem/rime-zhung                          # user/repo
-///   lotem/rime-zhung@master                   # 指定分支
-///   luna-pinyin:simp                          # 指定 recipe
-///   luna-pinyin:simp:key=val,key2=val2        # recipe + 选项
-///   lotem/rime-forge/lotem-packages.conf      # 远程包列表
-///   :preset / :extra / :all                   # 内置配置集
 #[derive(Parser, Debug)]
-#[command(
-    name = "rime-install",
-    version,
-    about = "Rime 配置管理器",
-    help_template = "\
-{about}
-
-用法: {usage}
-
-参数:
-{positionals}
-
-选项:
-{options}
-"
-)]
+#[command(name = "rime-install", version, about = "Rime 配置管理器")]
 struct Cli {
-    /// Rime 用户目录，不指定则自动探测
+    /// Rime 用户目录；默认读取 Weasel 注册表或探测前端
     #[arg(long, env = "RIME_DIR")]
     rime_dir: Option<PathBuf>,
-
-    /// Plum 工作目录（存放下载的包）
-    #[arg(long, env = "PLUM_DIR", default_value = "plum")]
-    plum_dir: PathBuf,
-
-    /// 跳过已有包的更新
+    /// 缓存目录；默认使用系统用户缓存目录下的 plum-rs
+    #[arg(long, env = "PLUM_DIR")]
+    plum_dir: Option<PathBuf>,
+    /// 跳过已有包与外部文件的更新
     #[arg(long)]
     no_update: bool,
-
-    /// 要安装的 target，示例：luna-pinyin
+    /// 无 target 时读取交互输入；重定向输入也可使用
+    #[arg(long)]
+    interactive: bool,
+    /// 安装 target：luna-pinyin、user/repo@branch:recipe:key=value、:preset、ZIP 或清单
     targets: Vec<String>,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // 如果没有 target，直接打印帮助并退出
-    if cli.targets.is_empty() {
-        println!("请指定要安装的 target。\n");
-        Cli::command().print_help()?;
-        println!();
-        return Ok(());
+    let mut cli = Cli::parse();
+    if cli.rime_dir.is_none() {
+        cli.rime_dir = std::env::var_os("rime_dir").map(PathBuf::from);
     }
-
-    let rime_dir = match cli.rime_dir {
-        Some(d) => d,
-        None => frontend::guess_rime_dir()
-            .context("无法自动探测 Rime 用户目录，请用 --rime-dir 手动指定")?,
-    };
-
-    println!("Rime 用户目录: {}", rime_dir.display());
-
-    let targets = cli.targets.clone();
-
-    let mut total_files = 0usize;
-    let mut total_packages = 0usize;
-
-    for raw in &targets {
-        if raw == "plum" {
-            println!("更新 plum 本身暂不支持（二进制版本请重新下载）");
-            continue;
-        }
-
-        let t = parse_target(raw).with_context(|| format!("无法解析 target: {}", raw))?;
-
-        let packages = resolve_target(t, &cli.plum_dir)?;
-
-        for pkg_ref in &packages {
-            let package_dir = cli
-                .plum_dir
-                .join("package")
-                .join(&pkg_ref.user)
-                .join(&pkg_ref.repo);
-
-            if !cli.no_update || !package_dir.exists() {
-                fetch::fetch_or_update(pkg_ref, &package_dir)?;
-            } else {
-                println!("已有包: {}/{}", pkg_ref.user, pkg_ref.repo);
+    if cli.plum_dir.is_none() {
+        cli.plum_dir = std::env::var_os("plum_dir").map(PathBuf::from);
+    }
+    cli.no_update |= std::env::var_os("no_update").is_some_and(|s| !s.is_empty());
+    let interactive = cli.interactive || (cli.targets.is_empty() && io::stdin().is_terminal());
+    if !interactive && cli.targets.is_empty() {
+        cli.targets.push(":preset".into());
+    }
+    let output = std::path::absolute(
+        cli.rime_dir
+            .clone()
+            .or_else(frontend::guess_rime_dir)
+            .context("无法自动探测 Rime 用户目录，请用 --rime-dir 指定")?,
+    )?;
+    let plum = std::path::absolute(
+        cli.plum_dir
+            .clone()
+            .or_else(frontend::default_plum_dir)
+            .context("无法探测缓存目录，请用 --plum-dir 指定")?,
+    )?;
+    println!(
+        "Rime 用户目录: {}\n缓存目录: {}",
+        output.display(),
+        plum.display()
+    );
+    if !cli.targets.is_empty() {
+        install_targets(&cli.targets, &plum, &output, cli.no_update)?;
+    }
+    if interactive {
+        loop {
+            print!("输入安装目标（空行安装 :preset，q 退出）: ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line)? == 0 {
+                break;
             }
-
-            let files = install_package(pkg_ref, &package_dir, &rime_dir)?;
-            total_files += files;
-            total_packages += 1;
+            let line = line.trim();
+            if matches!(line, "q" | "quit" | "exit") {
+                break;
+            }
+            // A whole local path may contain spaces.
+            let targets = if line.is_empty() {
+                vec![":preset".into()]
+            } else if Path::new(line).is_file() {
+                vec![line.into()]
+            } else {
+                line.split_whitespace().map(str::to_string).collect()
+            };
+            if let Err(e) = install_targets(&targets, &plum, &output, cli.no_update) {
+                eprintln!("安装失败: {e:#}");
+            }
         }
     }
-
-    if total_files == 0 {
-        println!("没有文件需要更新。");
-    } else {
-        println!(
-            "完成：共更新 {} 个文件，来自 {} 个包，输出到 '{}'",
-            total_files,
-            total_packages,
-            rime_dir.display()
-        );
-    }
-
     Ok(())
 }
 
-fn resolve_target(t: Target, plum_dir: &Path) -> Result<Vec<target::PackageRef>> {
-    match t {
-        Target::Package(p) => Ok(vec![p]),
-
-        Target::BuiltinConfig(name) => {
-            let conf_path = plum_dir.join(format!("{}-packages.conf", name));
-            if !conf_path.exists() {
-                bail!(
-                    "内置配置 '{}' 不存在，请确认 plum_dir 正确: {}",
-                    name,
-                    plum_dir.display()
-                );
-            }
-            let content = std::fs::read_to_string(&conf_path)?;
-            parse_package_list(&content)
+fn install_targets(raw: &[String], plum: &Path, output: &Path, no_update: bool) -> Result<()> {
+    let mut total = 0;
+    for raw in raw {
+        if raw == "plum" {
+            bail!("二进制版本不支持自更新，请下载新版 rime-install");
         }
-
-        Target::PackageList(pl) => {
-            let content = conf::fetch_conf_url(&pl.url)?;
-            parse_package_list(&content)
+        let target = parse_target(raw).with_context(|| format!("无法解析 target: {raw}"))?;
+        if let Target::Archive(source) = target {
+            total += archive::install(&source, plum, output, no_update)?;
+            continue;
+        }
+        for pkg in resolve_target(target, plum)? {
+            let package =
+                files::safe_join(&plum.join("package"), &format!("{}/{}", pkg.user, pkg.repo))?;
+            if !no_update || !package.is_dir() {
+                fetch::fetch_or_update(&pkg, &package)?;
+            }
+            let recipe = if let Some(name) = &pkg.recipe {
+                let file = files::safe_join(&package, &format!("{name}.recipe.yaml"))?;
+                if !file.is_file() {
+                    bail!("recipe 不存在: {}", file.display());
+                }
+                Some(file)
+            } else {
+                let file = package.join("recipe.yaml");
+                file.is_file().then_some(file)
+            };
+            total += if let Some(file) = recipe {
+                recipe::install_recipe(&file, &package, output, &pkg.options, no_update)?
+            } else {
+                if !pkg.options.is_empty() {
+                    bail!("包没有 recipe，无法消费选项");
+                }
+                recipe::install_default_files(&package, output)?
+            };
         }
     }
+    println!("完成：更新 {total} 个文件，输出到 '{}'", output.display());
+    Ok(())
 }
 
-fn parse_package_list(content: &str) -> Result<Vec<target::PackageRef>> {
-    let pkg_list = conf::load_conf_file(content)?;
-    pkg_list
-        .iter()
-        .map(|s| {
-            let Target::Package(p) = parse_target(s)? else {
-                bail!("conf 文件中包含非法 target: {}", s);
-            };
-            Ok(p)
+fn resolve_target(target: Target, plum: &Path) -> Result<Vec<target::PackageRef>> {
+    let location = match target {
+        Target::Package(pkg) => return Ok(vec![pkg]),
+        Target::BuiltinConfig(name) => format!("builtin:{name}-packages.conf"),
+        Target::PackageList(list) => list.url,
+        Target::LocalConfig(path) => path,
+        Target::Archive(_) => bail!("ZIP 不属于包清单"),
+    };
+    conf::load(&location, plum)?
+        .into_iter()
+        .map(|raw| match parse_target(&raw)? {
+            Target::Package(pkg) => Ok(pkg),
+            _ => bail!("conf 中包含非法 target: {raw}"),
         })
         .collect()
-}
-
-fn install_package(
-    pkg: &target::PackageRef,
-    package_dir: &Path,
-    output_dir: &Path,
-) -> Result<usize> {
-    let recipe_file = if let Some(r) = &pkg.recipe {
-        let f = package_dir.join(format!("{}.recipe.yaml", r));
-        if !f.exists() {
-            bail!("recipe 不存在: {}", f.display());
-        }
-        Some(f)
-    } else {
-        let f = package_dir.join("recipe.yaml");
-        if f.exists() { Some(f) } else { None }
-    };
-
-    if let Some(rf) = recipe_file {
-        recipe::install_recipe(&rf, package_dir, output_dir)
-    } else {
-        install_default_files(package_dir, output_dir)
-    }
-}
-
-fn install_default_files(package_dir: &Path, output_dir: &Path) -> Result<usize> {
-    let mut files = vec![];
-    for entry in std::fs::read_dir(package_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_config = name.ends_with(".yaml")
-            && !name.ends_with(".custom.yaml")
-            && !name.ends_with(".recipe.yaml")
-            && name != "recipe.yaml";
-        if is_config || name.ends_with(".txt") || name.ends_with(".gram") {
-            files.push(name);
-        }
-    }
-    let opencc_dir = package_dir.join("opencc");
-    if opencc_dir.is_dir() {
-        for entry in std::fs::read_dir(&opencc_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") || name.ends_with(".ocd") || name.ends_with(".txt") {
-                files.push(format!("opencc/{}", name));
-            }
-        }
-    }
-
-    let mut count = 0;
-    for file in &files {
-        let src = package_dir.join(file);
-        let dst = output_dir.join(file);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let changed = if dst.exists() {
-            std::fs::read(&src)? != std::fs::read(&dst)?
-        } else {
-            true
-        };
-        if changed {
-            if dst.exists() {
-                println!("更新: {}", file);
-            } else {
-                println!("安装: {}", file);
-            }
-            std::fs::copy(&src, &dst)?;
-            count += 1;
-        }
-    }
-    Ok(count)
 }

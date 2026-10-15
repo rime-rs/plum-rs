@@ -13,6 +13,8 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
+    Archive(String),
+    LocalConfig(String),
     /// :preset / :extra / :all
     BuiltinConfig(String),
     /// 远程 packages.conf 的 URL 或短路径
@@ -45,13 +47,7 @@ pub struct PackageRef {
 impl PackageRef {
     /// 完整的 GitHub 仓库路径，如 "rime/rime-luna-pinyin"
     pub fn github_path(&self) -> String {
-        // 原始 shell 脚本逻辑：不含斜杠的短名自动加 rime- 前缀，归属 rime 组织
-        let proj = if self.user == "rime" && !self.project.starts_with("rime-") {
-            format!("rime-{}", self.project)
-        } else {
-            self.project.clone()
-        };
-        format!("{}/{}", self.user, proj)
+        format!("{}/{}", self.user, self.project)
     }
 
     pub fn clone_url(&self) -> String {
@@ -67,13 +63,50 @@ pub enum ParseError {
 }
 
 pub fn parse_target(s: &str) -> Result<Target, ParseError> {
+    let invalid = || ParseError::Unrecognized(s.into());
+    if s.is_empty() {
+        return Err(invalid());
+    }
+    if s.starts_with("https://") || s.starts_with("http://") {
+        let url = url::Url::parse(s).map_err(|_| invalid())?;
+        if url.path().to_ascii_lowercase().ends_with(".zip") {
+            return Ok(Target::Archive(s.into()));
+        }
+        if url.path().ends_with(".conf") {
+            return Ok(Target::PackageList(PackageListRef { url: s.into() }));
+        }
+    }
+    if s.to_ascii_lowercase().ends_with(".zip") {
+        return Ok(Target::Archive(s.into()));
+    }
     // 内置配置 :preset / :extra / :all
     if let Some(name) = s.strip_prefix(':') {
+        if !valid_component(name) {
+            return Err(invalid());
+        }
         return Ok(Target::BuiltinConfig(name.to_string()));
     }
 
     // 完整 URL 或 packages.conf 短路径
-    if s.starts_with("https://") || s.ends_with("-packages.conf") {
+    if s.starts_with("https://github.com/") && !s.ends_with(".conf") {
+        let path = s
+            .strip_prefix("https://github.com/")
+            .unwrap()
+            .trim_end_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return Ok(Target::Package(parse_package_ref(path)?));
+    }
+    if s.ends_with(".conf") && std::path::Path::new(s).is_file() {
+        return Ok(Target::LocalConfig(s.into()));
+    }
+    if s.starts_with("https://") || s.starts_with("http://") || s.ends_with("-packages.conf") {
+        if (s.starts_with("https://") || s.starts_with("http://"))
+            && !url::Url::parse(s)
+                .map(|u| u.path().ends_with(".conf"))
+                .unwrap_or(false)
+        {
+            return Err(invalid());
+        }
         let url = expand_conf_url(s);
         return Ok(Target::PackageList(PackageListRef { url }));
     }
@@ -83,7 +116,7 @@ pub fn parse_target(s: &str) -> Result<Target, ParseError> {
 }
 
 fn expand_conf_url(s: &str) -> String {
-    if s.starts_with("https://") {
+    if s.starts_with("https://") || s.starts_with("http://") {
         return s.to_string();
     }
     // 格式：user/repo@branch/filepath 或 user/repo/filepath
@@ -120,6 +153,16 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
     };
 
     let options = parse_options(opts_str);
+    let mut seen = std::collections::HashSet::new();
+    if !opts_str.is_empty()
+        && (opts_str.split(',').any(|entry| !entry.contains('='))
+            || options.len() != opts_str.split(',').count()
+            || options.iter().any(|(key, _)| {
+                !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !seen.insert(key)
+            }))
+    {
+        return Err(ParseError::Unrecognized(s.into()));
+    }
 
     // 解析 <pkg>[@branch]
     let (pkg_part, branch) = match pkg_and_branch.split_once('@') {
@@ -137,11 +180,28 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
         (u, r, proj)
     } else {
         // 短名：归属 rime 组织
-        let proj = pkg_part.to_string();
+        let proj = if pkg_part.starts_with("rime-") {
+            pkg_part.to_string()
+        } else {
+            format!("rime-{pkg_part}")
+        };
         let r = proj.strip_prefix("rime-").unwrap_or(&proj).to_string();
         ("rime".to_string(), r, proj)
     };
 
+    if !valid_component(&user)
+        || !valid_component(&repo)
+        || !valid_component(&project)
+        || recipe.as_deref().is_some_and(|r| !valid_component(r))
+        || branch.as_deref().is_some_and(|b| {
+            b.is_empty()
+                || b.starts_with('-')
+                || b.contains(['\\', ':', ' ', '\n'])
+                || b.split('/').any(|p| p == "..")
+        })
+    {
+        return Err(ParseError::Unrecognized(s.into()));
+    }
     Ok(PackageRef {
         user,
         repo,
@@ -150,6 +210,15 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
         recipe,
         options,
     })
+}
+
+fn valid_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.ends_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn split_once_or(s: &str, delim: char) -> (&str, &str) {
@@ -175,6 +244,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn urls_and_invalid_targets() {
+        for raw in [
+            "https://github.com/rime/rime-luna-pinyin",
+            "https://github.com/rime/rime-luna-pinyin.git",
+            "https://github.com/rime/rime-luna-pinyin/",
+        ] {
+            let Target::Package(pkg) = parse_target(raw).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                pkg.clone_url(),
+                "https://github.com/rime/rime-luna-pinyin.git"
+            );
+        }
+        assert!(matches!(
+            parse_target("https://example.com/package.zip?download=1").unwrap(),
+            Target::Archive(_)
+        ));
+        assert!(matches!(
+            parse_target("https://example.com/a.conf?raw=1").unwrap(),
+            Target::PackageList(_)
+        ));
+        for raw in [
+            "",
+            "../bad",
+            "user/../../bad",
+            ":../bad",
+            "luna-pinyin:../bad",
+            "luna-pinyin::=oops",
+            "luna-pinyin::size=1,size=2",
+            "luna-pinyin::flag",
+        ] {
+            assert!(parse_target(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
     fn test_builtin() {
         assert_eq!(
             parse_target(":preset").unwrap(),
@@ -188,7 +294,7 @@ mod tests {
         let Target::Package(p) = t else { panic!() };
         assert_eq!(p.user, "rime");
         assert_eq!(p.repo, "luna-pinyin");
-        assert_eq!(p.project, "luna-pinyin");
+        assert_eq!(p.project, "rime-luna-pinyin");
         assert_eq!(p.github_path(), "rime/rime-luna-pinyin");
     }
 

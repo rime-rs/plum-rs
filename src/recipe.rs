@@ -1,6 +1,10 @@
-use anyhow::{Context, Result};
+use crate::files::{commit, safe_join};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+};
 use yaml_serde::{Value, from_str};
 
 #[derive(Debug, Deserialize)]
@@ -9,318 +13,453 @@ pub enum StringOrVec {
     String(String),
     Vec(Vec<String>),
 }
-
 impl StringOrVec {
     pub fn into_vec(self) -> Vec<String> {
         match self {
-            StringOrVec::String(s) => s.split_whitespace().map(|x| x.to_string()).collect(),
-            StringOrVec::Vec(v) => v,
+            Self::String(s) => s.split_whitespace().map(str::to_string).collect(),
+            Self::Vec(v) => v,
         }
     }
 }
 
-/// recipe.yaml 的结构
-/// 只实现 install_files 段，download_files 和 patch 后续扩展
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
-    pub recipe: Option<RecipeInfo>,
+    pub recipe: Option<Value>,
     pub install_files: Option<StringOrVec>,
     pub download_files: Option<StringOrVec>,
+    pub patch_files: Option<BTreeMap<String, Value>>,
+    // Explicitly diagnose this previously silently ignored field.
     pub patch: Option<Value>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct RecipeInfo {
-    #[serde(rename = "Rx")]
-    pub rx: Option<String>,
+pub fn load_recipe(file: &Path) -> Result<Recipe> {
+    from_str(&std::fs::read_to_string(file)?)
+        .with_context(|| format!("解析 recipe.yaml 失败: {}", file.display()))
 }
 
-pub fn load_recipe(recipe_file: &Path) -> Result<Recipe> {
-    let content = std::fs::read_to_string(recipe_file)
-        .with_context(|| format!("读取 recipe 失败: {}", recipe_file.display()))?;
-    let recipe: Recipe = from_str(&content)
-        .with_context(|| format!("解析 recipe.yaml 失败: {}", recipe_file.display()))?;
-    Ok(recipe)
-}
-
-pub fn install_recipe(recipe_file: &Path, package_dir: &Path, output_dir: &Path) -> Result<usize> {
-    let recipe = load_recipe(recipe_file)?;
-    let mut count = 0;
-
-    if let Some(files) = recipe.install_files {
-        count += install_files(&files.into_vec(), package_dir, output_dir)?;
-    } else {
-        // 没有 recipe 指定时，装所有符合条件的文件（同 install_files_from_package）
-        let files = collect_default_files(package_dir)?;
-        count += install_files(&files, package_dir, output_dir)?;
+/// Expand named options only. Shell commands and unknown variables fail before writes.
+fn expand(
+    text: &str,
+    options: &HashMap<String, String>,
+    used: &mut HashSet<String>,
+) -> Result<String> {
+    if text.contains('`') || text.contains("$(") {
+        bail!("不支持 recipe 中的 Shell 命令执行");
     }
-
-    Ok(count)
-}
-
-/// 没有 recipe 时的默认文件收集规则，对应原 install_files_from_package
-fn collect_default_files(package_dir: &Path) -> Result<Vec<String>> {
-    let mut files = vec![];
-
-    for entry in std::fs::read_dir(package_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_config = name.ends_with(".yaml")
-            && !name.ends_with(".custom.yaml")
-            && !name.ends_with(".recipe.yaml")
-            && name != "recipe.yaml";
-        if is_config || name.ends_with(".txt") || name.ends_with(".gram") {
-            files.push(name);
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
         }
-    }
-
-    // opencc 子目录
-    let opencc_dir = package_dir.join("opencc");
-    if opencc_dir.is_dir() {
-        for entry in std::fs::read_dir(&opencc_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") || name.ends_with(".ocd") || name.ends_with(".txt") {
-                files.push(format!("opencc/{}", name));
+        // Regex anchors and literal dollar signs are common in Rime patches.
+        if !chars
+            .peek()
+            .is_some_and(|c| *c == '{' || c.is_ascii_alphanumeric() || *c == '_')
+        {
+            out.push('$');
+            continue;
+        }
+        let braced = chars.peek() == Some(&'{');
+        let mut expr = String::new();
+        if braced {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('}') => break,
+                    Some(c) => expr.push(c),
+                    None => bail!("recipe 变量未闭合"),
+                }
+            }
+        } else {
+            while let Some(c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || *c == '_' {
+                    expr.push(*c);
+                    chars.next();
+                } else {
+                    break;
+                }
             }
         }
+        let (key, default) = expr
+            .split_once(":-")
+            .map_or((expr.as_str(), None), |(k, v)| (k, Some(v)));
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!("不支持 recipe 变量: {expr}");
+        }
+        let value = options
+            .get(key)
+            .filter(|v| default.is_none() || !v.is_empty())
+            .map(String::as_str)
+            .or(default)
+            .with_context(|| format!("recipe 选项未提供: {key}"))?;
+        used.insert(key.into());
+        out.push_str(value);
     }
+    Ok(out)
+}
 
+fn expand_value(
+    value: Value,
+    options: &HashMap<String, String>,
+    used: &mut HashSet<String>,
+) -> Result<Value> {
+    Ok(match value {
+        Value::String(s) => {
+            let expanded = expand(&s, options, used)?;
+            if s.starts_with('$') && !s[1..].contains('$') && expanded != s {
+                match from_str::<Value>(&expanded) {
+                    Ok(value @ (Value::Number(_) | Value::Bool(_) | Value::Null)) => value,
+                    _ => Value::String(expanded),
+                }
+            } else {
+                Value::String(expanded)
+            }
+        }
+        Value::Sequence(v) => Value::Sequence(
+            v.into_iter()
+                .map(|v| expand_value(v, options, used))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Mapping(m) => {
+            let mut output = yaml_serde::Mapping::new();
+            for (k, v) in m {
+                output.insert(
+                    expand_value(k, options, used)?,
+                    expand_value(v, options, used)?,
+                );
+            }
+            Value::Mapping(output)
+        }
+        Value::Tagged(_) => bail!("不支持 recipe 补丁中的 YAML 标签"),
+        v => v,
+    })
+}
+
+pub fn install_recipe(
+    file: &Path,
+    package: &Path,
+    output: &Path,
+    options: &[(String, String)],
+    no_update: bool,
+) -> Result<usize> {
+    let recipe = load_recipe(file)?;
+    if recipe.patch.is_some() {
+        bail!("不支持 recipe.patch；请使用 patch_files: 文件名: 补丁映射");
+    }
+    if let Some(info) = &recipe.recipe
+        && let Some(rx) = info.get("Rx").and_then(Value::as_str)
+        && let Some(stem) = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix(".recipe.yaml"))
+        && rx != stem
+    {
+        bail!("recipe.Rx '{rx}' 与文件名 '{stem}' 不一致");
+    }
+    let vars: HashMap<_, _> = options.iter().cloned().collect();
+    let mut used = HashSet::new();
+    let mut downloads = Vec::new();
+    for spec in recipe
+        .download_files
+        .map(StringOrVec::into_vec)
+        .unwrap_or_default()
+    {
+        let spec = expand(&spec, &vars, &mut used)?;
+        let (name, url) = if let Some(pair) = spec.split_once("::") {
+            (pair.0.to_string(), pair.1.to_string())
+        } else {
+            let url = url::Url::parse(&spec)?;
+            let name = url
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .filter(|s| !s.is_empty())
+                .context("下载 URL 缺少文件名")?
+                .to_string();
+            (name, spec)
+        };
+        let parsed = url::Url::parse(&url)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("不支持下载协议: {url}");
+        }
+        safe_join(package, &name)?;
+        downloads.push((name, url));
+    }
+    let patterns = recipe
+        .install_files
+        .map(StringOrVec::into_vec)
+        .map(|patterns| {
+            patterns
+                .into_iter()
+                .map(|p| expand(&p, &vars, &mut used))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let mut patches = BTreeMap::new();
+    for (name, patch) in recipe.patch_files.unwrap_or_default() {
+        let name = expand(&name, &vars, &mut used)?;
+        safe_join(output, &name)?;
+        let patch = expand_value(patch, &vars, &mut used)?;
+        if !patch.is_mapping() {
+            bail!("patch_files.{name} 必须是 YAML 映射；不支持 Shell 脚本");
+        }
+        patches.insert(name, patch);
+    }
+    for (key, _) in options {
+        if !used.contains(key) {
+            bail!("未使用的 recipe 选项: {key}");
+        }
+    }
+    // Validate all declarations before network or installation side effects.
+    if let Some(patterns) = &patterns {
+        for pattern in patterns {
+            safe_join(package, pattern)?;
+            glob::Pattern::new(pattern)?;
+        }
+    }
+    for (name, url) in downloads {
+        let path = safe_join(package, &name)?;
+        if no_update && path.is_file() {
+            continue;
+        }
+        println!("下载文件: {url}");
+        let bytes = ureq::get(&url)
+            .call()?
+            .into_body()
+            .with_config()
+            .limit(128 * 1024 * 1024)
+            .read_to_vec()?;
+        crate::files::atomic_write(&path, &bytes)?;
+    }
+    let patterns = match patterns {
+        Some(p) => p,
+        None => collect_default_files(package)?,
+    };
+    let mut files = collect_files(&patterns, package)?;
+    for (name, patch) in patches {
+        let existing = if let Some(bytes) = files.get(&name) {
+            Some(bytes.clone())
+        } else {
+            match std::fs::read(safe_join(output, &name)?) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let mut document: Value = match existing {
+            Some(b) => {
+                yaml_serde::from_slice(&b).with_context(|| format!("补丁目标不是 YAML: {name}"))?
+            }
+            None => Value::Mapping(Default::default()),
+        };
+        let mapping = document
+            .as_mapping_mut()
+            .context("补丁目标必须是 YAML 映射")?;
+        let key = Value::String("__patch".into());
+        if !mapping.contains_key(&key) {
+            mapping.insert(key.clone(), Value::Mapping(Default::default()));
+        }
+        let target = mapping
+            .get_mut(&key)
+            .unwrap()
+            .as_mapping_mut()
+            .context("现有 __patch 必须是 YAML 映射")?;
+        for (k, v) in patch.as_mapping().unwrap() {
+            target.insert(k.clone(), v.clone());
+        }
+        files.insert(name, yaml_serde::to_string(&document)?.into_bytes());
+    }
+    commit(output, files)
+}
+
+pub fn install_default_files(package: &Path, output: &Path) -> Result<usize> {
+    commit(
+        output,
+        collect_files(&collect_default_files(package)?, package)?,
+    )
+}
+
+fn collect_default_files(package: &Path) -> Result<Vec<String>> {
+    fn visit(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ty.is_symlink()
+                || name.starts_with('.')
+                || matches!(name.as_str(), "build" | "target")
+            {
+                continue;
+            }
+            if ty.is_dir() {
+                visit(root, &entry.path(), files)?;
+            } else if ty.is_file() {
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if matches!(
+                    ext.as_str(),
+                    "yaml" | "txt" | "gram" | "lua" | "json" | "ocd" | "ocd2"
+                ) && !name.ends_with(".custom.yaml")
+                    && !name.ends_with(".recipe.yaml")
+                    && name != "recipe.yaml"
+                {
+                    files.push(
+                        entry
+                            .path()
+                            .strip_prefix(root)?
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(package, package, &mut files)?;
     Ok(files)
 }
 
-fn install_files(files: &[String], package_dir: &Path, output_dir: &Path) -> Result<usize> {
-    let mut count = 0;
-
-    let pkg_dir_str = package_dir.to_string_lossy().replace("\\", "/");
-    let escaped_dir = glob::Pattern::escape(&pkg_dir_str);
-
-    for pattern in files {
-        let glob_pattern = format!("{}/{}", escaped_dir, pattern.replace("\\", "/"));
-        let mut matched_any = false;
-
-        if let Ok(paths) = glob::glob(&glob_pattern) {
-            for entry in paths.filter_map(Result::ok) {
-                if !entry.is_file() {
-                    continue;
-                }
-                matched_any = true;
-
-                let rel_path = match entry.strip_prefix(package_dir) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                let dst = output_dir.join(rel_path);
-
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-                }
-
-                if dst.exists() {
-                    if files_identical(&entry, &dst)? {
-                        continue;
-                    }
-                    println!("更新: {}", rel_path.display());
-                } else {
-                    println!("安装: {}", rel_path.display());
-                }
-
-                std::fs::copy(&entry, &dst).with_context(|| {
-                    format!("复制文件失败: {} -> {}", entry.display(), dst.display())
-                })?;
-                count += 1;
+fn collect_files(patterns: &[String], package: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let root = glob::Pattern::escape(&package.to_string_lossy().replace('\\', "/"));
+    for pattern in patterns {
+        safe_join(package, pattern)?;
+        let mut matched = false;
+        for entry in glob::glob(&format!("{root}/{}", pattern.replace('\\', "/")))? {
+            let entry = entry?;
+            if !entry.is_file() {
+                continue;
             }
+            let relative = entry
+                .strip_prefix(package)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let checked = safe_join(package, &relative)?;
+            files.insert(relative, std::fs::read(checked)?);
+            matched = true;
         }
-
-        if !matched_any {
-            eprintln!("警告: 匹配不到文件，跳过: {}", pattern);
+        if !matched {
+            bail!("匹配不到 install_files 文件: {pattern}");
         }
     }
-
-    Ok(count)
-}
-
-fn files_identical(a: &Path, b: &Path) -> Result<bool> {
-    let a = std::fs::read(a)?;
-    let b = std::fs::read(b)?;
-    Ok(a == b)
+    Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    /// 每个测试使用独立临时目录，避免并行执行时互相干扰
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            // 建在 target/ 下而非系统临时目录：受限环境下 %TEMP% 未必可写，
-            // 而 target/ 已被 .gitignore 忽略，且一定随构建目录一起可写。
-            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("test-tmp")
-                .join(format!("recipe-{}-{}-{}", std::process::id(), tag, n));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
+    #[test]
+    fn downloads_named_file_then_installs_and_respects_no_update() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nschema: test").unwrap();
+        });
+        let pkg = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let file = pkg.path().join("recipe.yaml");
+        std::fs::write(&file,format!("download_files:\n  - nested/a.yaml::http://{address}/remote\ninstall_files: nested/a.yaml\n")).unwrap();
+        assert_eq!(
+            install_recipe(&file, pkg.path(), out.path(), &[], false).unwrap(),
+            1
+        );
+        server.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("nested/a.yaml")).unwrap(),
+            "schema: test"
+        );
+        assert_eq!(
+            install_recipe(&file, pkg.path(), out.path(), &[], true).unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn patch_options_and_idempotence() {
+        let pkg = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(pkg.path().join("a.yaml"), "schema: original\n").unwrap();
+        let file = pkg.path().join("recipe.yaml");
+        std::fs::write(&file, "install_files: a.yaml\npatch_files:\n  a.yaml:\n    schema/name: ${name}\n  default.custom.yaml:\n    menu/page_size: 9\n").unwrap();
+        let options = vec![("name".into(), "中文名字".into())];
+        assert_eq!(
+            install_recipe(&file, pkg.path(), out.path(), &options, false).unwrap(),
+            2
+        );
+        let value: Value =
+            from_str(&std::fs::read_to_string(out.path().join("a.yaml")).unwrap()).unwrap();
+        assert_eq!(
+            value["__patch"]["schema/name"],
+            Value::String("中文名字".into())
+        );
+        assert_eq!(
+            install_recipe(&file, pkg.path(), out.path(), &options, false).unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn rejects_unsupported_before_install() {
+        let pkg = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let file = pkg.path().join("recipe.yaml");
+        for body in [
+            "patch: {}",
+            "unknown: true",
+            "patch_files:\n  ../escape.yaml: {}",
+            "patch_files:\n  a.yaml:\n    key: $(touch bad)",
+        ] {
+            std::fs::write(&file, body).unwrap();
+            assert!(install_recipe(&file, pkg.path(), out.path(), &[], false).is_err());
+            assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
         }
-
-        fn path(&self) -> &Path {
-            &self.0
+    }
+    #[test]
+    fn recursive_defaults_and_missing_pattern() {
+        let pkg = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        for name in [
+            "a.yaml",
+            "lua/a.lua",
+            "dict/a.dict.yaml",
+            "opencc/a.ocd2",
+            "skip.custom.yaml",
+        ] {
+            let p = pkg.path().join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "test").unwrap();
         }
+        assert_eq!(install_default_files(pkg.path(), out.path()).unwrap(), 4);
+        assert!(collect_files(&["absent.yaml".into()], pkg.path()).is_err());
     }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn write_file(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(&path, body).unwrap();
-        path
-    }
-
     #[test]
-    fn test_into_vec_splits_whitespace() {
-        let files = StringOrVec::String("a.yaml b.txt\nc.gram".into()).into_vec();
-        assert_eq!(files, vec!["a.yaml", "b.txt", "c.gram"]);
-    }
-
-    #[test]
-    fn test_into_vec_keeps_list() {
-        let files = StringOrVec::Vec(vec!["a.yaml".into(), "b.txt".into()]).into_vec();
-        assert_eq!(files, vec!["a.yaml", "b.txt"]);
-    }
-
-    #[test]
-    fn test_load_recipe_accepts_string_install_files() {
-        let dir = TempDir::new("string");
-        let path = write_file(dir.path(), "recipe.yaml", "install_files: a.yaml b.txt\n");
-
-        let recipe = load_recipe(&path).unwrap();
+    fn expansions() {
+        let vars = HashMap::from([("name".into(), "Alice".into())]);
+        let mut used = HashSet::new();
         assert_eq!(
-            recipe.install_files.unwrap().into_vec(),
-            vec!["a.yaml", "b.txt"]
+            expand("$name ${other:-default}", &vars, &mut used).unwrap(),
+            "Alice default"
         );
-        assert!(recipe.download_files.is_none());
-        assert!(recipe.patch.is_none());
-    }
-
-    #[test]
-    fn test_load_recipe_accepts_list_patch_and_rx() {
-        let dir = TempDir::new("list");
-        let path = write_file(
-            dir.path(),
-            "recipe.yaml",
-            "\
-recipe:
-  Rx: luna-pinyin
-install_files:
-  - a.yaml
-  - opencc/*.json
-download_files: extra/*.yaml
-patch:
-  speller/alphabet: zyxwvutsrqponmlkjihgfedcba
-",
-        );
-
-        let recipe = load_recipe(&path).unwrap();
-        assert_eq!(recipe.recipe.unwrap().rx.as_deref(), Some("luna-pinyin"));
+        assert!(expand("${missing}", &vars, &mut used).is_err());
         assert_eq!(
-            recipe.install_files.unwrap().into_vec(),
-            vec!["a.yaml", "opencc/*.json"]
+            expand("derive/x$/y/", &vars, &mut used).unwrap(),
+            "derive/x$/y/"
         );
         assert_eq!(
-            recipe.download_files.unwrap().into_vec(),
-            vec!["extra/*.yaml"]
+            expand_value(Value::String("${size:-9}".into()), &vars, &mut used).unwrap(),
+            Value::Number(9.into())
         );
-
-        // patch 段以通用 Value 解析，确认新 YAML 后端与 serde_yaml 的 Value 行为一致
-        let patch = recipe.patch.expect("patch 段应被解析");
-        let Value::Mapping(mapping) = &patch else {
-            panic!("patch 应为 mapping，实际为 {patch:?}");
-        };
-        assert_eq!(mapping.len(), 1);
-    }
-
-    #[test]
-    fn test_load_recipe_reports_parse_error() {
-        let dir = TempDir::new("bad");
-        let path = write_file(dir.path(), "recipe.yaml", "install_files: [unclosed\n");
-
-        let err = load_recipe(&path).unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("解析 recipe.yaml 失败"),
-            "错误信息缺少上下文: {message}"
-        );
-    }
-
-    #[test]
-    fn test_install_recipe_copies_only_matched_files() {
-        let pkg = TempDir::new("pkg");
-        let out = TempDir::new("out");
-
-        write_file(pkg.path(), "a.yaml", "alpha");
-        write_file(pkg.path(), "b.txt", "beta");
-        write_file(pkg.path(), "opencc/t2s.json", "{}");
-        let recipe_file = write_file(
-            pkg.path(),
-            "recipe.yaml",
-            "install_files:\n  - a.yaml\n  - opencc/*.json\n",
-        );
-
-        let count = install_recipe(&recipe_file, pkg.path(), out.path()).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(
-            fs::read_to_string(out.path().join("a.yaml")).unwrap(),
-            "alpha"
-        );
-        assert_eq!(
-            fs::read_to_string(out.path().join("opencc/t2s.json")).unwrap(),
-            "{}"
-        );
-        assert!(!out.path().join("b.txt").exists());
-        assert!(!out.path().join("recipe.yaml").exists());
-
-        // 内容未变化时重复安装不应重复计数
-        let count = install_recipe(&recipe_file, pkg.path(), out.path()).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_install_recipe_without_install_files_falls_back_to_defaults() {
-        let pkg = TempDir::new("defaults");
-        let out = TempDir::new("defaults-out");
-
-        write_file(pkg.path(), "luna.yaml", "x");
-        write_file(pkg.path(), "luna.custom.yaml", "x");
-        write_file(pkg.path(), "other.recipe.yaml", "x");
-        write_file(pkg.path(), "notes.txt", "x");
-        let recipe_file = write_file(pkg.path(), "recipe.yaml", "recipe:\n  Rx: luna\n");
-
-        let count = install_recipe(&recipe_file, pkg.path(), out.path()).unwrap();
-        assert_eq!(count, 2);
-        assert!(out.path().join("luna.yaml").exists());
-        assert!(out.path().join("notes.txt").exists());
-        assert!(!out.path().join("luna.custom.yaml").exists());
-        assert!(!out.path().join("other.recipe.yaml").exists());
-        assert!(!out.path().join("recipe.yaml").exists());
     }
 }

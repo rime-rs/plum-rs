@@ -26,6 +26,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             kind: windows
 
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            kind: windows
+
           # Windows GNU x64
           - os: windows-latest
             target: x86_64-pc-windows-gnu
@@ -68,6 +72,7 @@ jobs:
 
     env:
       BINARY_NAME: rime-install
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
 
@@ -81,6 +86,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Check release version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "v$version" = "$RELEASE_TAG"
 
       # Windows GNU toolchain
       - name: Setup MinGW
@@ -148,7 +159,7 @@ jobs:
             --locked \
             --target "${{ matrix.target }}" \
             --bin rime-install \
-            --features git2/vendored-openssl,git2/vendored-libgit2
+            --features vendored-openssl
 
       # Build all other targets
       - name: Build
@@ -160,9 +171,34 @@ jobs:
             --locked \
             --target "${{ matrix.target }}" \
             --bin rime-install \
-            --features git2/vendored-openssl,git2/vendored-libgit2
+            --features vendored-openssl
 
       # Collect Windows binary
+      - name: Smoke test release HTTPS installation
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess, tempfile
+          binary = pathlib.Path('target/${{ matrix.target }}/release/rime-install' + ('.exe' if os.name == 'nt' else '')).resolve()
+          version = subprocess.check_output([str(binary), '--version'], text=True).strip()
+          assert version == 'rime-install ' + os.environ['RELEASE_TAG'].removeprefix('v'), version
+          with tempfile.TemporaryDirectory() as temp:
+              root = pathlib.Path(temp)
+              subprocess.run([str(binary), '--plum-dir', str(root / 'cache'), '--rime-dir', str(root / 'rime'), 'luna-pinyin'], check=True)
+              assert (root / 'rime/luna_pinyin.schema.yaml').is_file()
+          PY
+
+      - name: Verify MSVC runtime is static
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $tools = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'Hostarm64/arm64' } else { 'Hostx64/x64' }
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}/Microsoft Visual Studio/*/*/VC/Tools/MSVC/*/bin/$tools/dumpbin.exe" | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          $imports = & $dumpbin.FullName /dependents "target/${{ matrix.target }}/release/rime-install.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed' }
+          if ($imports -match '(?i)(VCRUNTIME|MSVCP|ucrtbase|api-ms-win-crt).*\.dll') { throw 'Unexpected dynamic CRT dependency' }
+
       - name: Collect Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -226,6 +262,11 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout license and documentation
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Download binaries
         uses: actions/download-artifact@v8
         with:
@@ -233,25 +274,36 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Ensure all nine binaries exist
+      # Ensure all ten binaries exist
       - name: Verify artifact count
         shell: bash
         run: |
           count=$(find dist -maxdepth 1 -type f | wc -l)
 
-          if [[ "$count" -ne 9 ]]; then
-            echo "::error::Expected 9 binaries, found $count"
+          if [[ "$count" -ne 10 ]]; then
+            echo "::error::Expected 10 binaries, found $count"
             exit 1
           fi
 
-          echo "All 9 binaries collected"
+          echo "All 10 binaries collected"
+
+      - name: Include license and source information
+        shell: bash
+        run: |
+          cp LICENSE dist/LICENSE.txt
+          cp README.md dist/README.md
+          cp windows/rime-install.bat dist/rime-install.bat
+          printf 'Source: %s/%s/tree/%s\nArchive: %s/%s/archive/refs/tags/%s.tar.gz\n' \
+            '${{ github.server_url }}' '${{ github.repository }}' '${{ github.event.release.tag_name }}' \
+            '${{ github.server_url }}' '${{ github.repository }}' '${{ github.event.release.tag_name }}' \
+            > dist/SOURCE.txt
 
       # Generate SHA256 checksums
       - name: Generate SHA256 checksums
         shell: bash
         working-directory: dist
         run: |
-          sha256sum rime-install-* > SHA256SUMS.txt
+          sha256sum rime-install-* rime-install.bat LICENSE.txt README.md SOURCE.txt > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Publish to existing GitHub Release

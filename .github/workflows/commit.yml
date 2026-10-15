@@ -90,7 +90,10 @@ jobs:
   # ============================================
   test:
     name: Build & Test
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -102,6 +105,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install native dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -117,6 +121,7 @@ jobs:
           key: test
 
       - name: Build
+        shell: bash
         run: |
           cargo build \
             --verbose \
@@ -125,12 +130,16 @@ jobs:
             --all-features
 
       - name: Run tests
+        shell: bash
         run: |
           cargo test \
             --verbose \
             --locked \
             --all-targets \
             --all-features
+
+      - name: Verify real Git HTTPS clone and update
+        run: cargo test --locked online_clone_and_update -- --ignored
 
   # ============================================
   # Security Audit - RustSec Advisories
