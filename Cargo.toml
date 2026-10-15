@@ -18,3 +18,10 @@ serde = {version = "1.0.229", features = ["derive"]}
 thiserror = "2.0.21"
 ureq = "3.4.2"
 yaml_serde = "0.10.7"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
