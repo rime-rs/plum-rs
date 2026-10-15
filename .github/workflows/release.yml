@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -82,6 +82,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Windows GNU toolchain
       - name: Setup MinGW
         if: matrix.kind == 'windows-gnu'
         uses: msys2/setup-msys2@v2
@@ -92,9 +93,11 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-make
+            mingw-w64-x86_64-cmake
             make
             perl
 
+      # Linux native dependencies
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -105,13 +108,16 @@ jobs:
             cmake \
             pkg-config \
             perl \
-            libssl-dev
+            libssl-dev \
+            binutils
 
+      # MUSL static toolchain
       - name: Install MUSL toolchain
         if: matrix.kind == 'linux-musl'
         shell: bash
         run: |
           sudo apt-get install -y musl-tools
+
           echo "CC=musl-gcc" >> "$GITHUB_ENV"
           echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
 
@@ -123,16 +129,20 @@ jobs:
             echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
           fi
 
+      # Cache Cargo dependencies
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
+      # Build Windows GNU
       - name: Build Windows GNU
         if: matrix.kind == 'windows-gnu'
         shell: msys2 {0}
         run: |
           export CC_x86_64_pc_windows_gnu=gcc
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc
+
           cargo build \
             --release \
             --locked \
@@ -140,7 +150,8 @@ jobs:
             --bin rime-install \
             --features git2/vendored-openssl,git2/vendored-libgit2
 
-      - name: Build other targets
+      # Build all other targets
+      - name: Build
         if: matrix.kind != 'windows-gnu'
         shell: bash
         run: |
@@ -151,6 +162,7 @@ jobs:
             --bin rime-install \
             --features git2/vendored-openssl,git2/vendored-libgit2
 
+      # Collect Windows binary
       - name: Collect Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -161,6 +173,7 @@ jobs:
             "target/${{ matrix.target }}/release/rime-install.exe" `
             "dist/rime-install-${{ matrix.target }}.exe"
 
+      # Collect Linux and macOS binary
       - name: Collect Unix binary
         if: runner.os != 'Windows'
         shell: bash
@@ -175,6 +188,7 @@ jobs:
 
           file "dist/rime-install-${{ matrix.target }}"
 
+      # Verify MUSL is statically linked
       - name: Verify MUSL static linking
         if: matrix.kind == 'linux-musl'
         shell: bash
@@ -193,13 +207,15 @@ jobs:
 
           echo "Static linking verified"
 
+      # Upload temporary build artifact
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   publish:
     name: Publish Release
@@ -211,12 +227,13 @@ jobs:
 
     steps:
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           path: dist
           merge-multiple: true
 
+      # Ensure all nine binaries exist
       - name: Verify artifact count
         shell: bash
         run: |
@@ -227,14 +244,19 @@ jobs:
             exit 1
           fi
 
+          echo "All 9 binaries collected"
+
+      # Generate SHA256 checksums
       - name: Generate SHA256 checksums
         shell: bash
         working-directory: dist
         run: |
           sha256sum rime-install-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
+      # Publish to existing GitHub Release
       - name: Upload GitHub Release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.release.tag_name }}
           files: dist/*
