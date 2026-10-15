@@ -22,7 +22,9 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # Formatting
+  # ============================================
+  # Rustfmt - Formatting
+  # ============================================
   fmt:
     name: Rustfmt
     runs-on: ubuntu-24.04
@@ -41,7 +43,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Static analysis
+  # ============================================
+  # Clippy - Static Analysis
+  # ============================================
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
@@ -81,7 +85,9 @@ jobs:
             -- \
             -D warnings
 
-  # Build and unit tests
+  # ============================================
+  # Build & Test
+  # ============================================
   test:
     name: Build & Test
     runs-on: ubuntu-24.04
@@ -126,7 +132,9 @@ jobs:
             --all-targets \
             --all-features
 
-  # Dependency security audit
+  # ============================================
+  # Security Audit - RustSec Advisories
+  # ============================================
   audit:
     name: Security Audit
     runs-on: ubuntu-24.04
@@ -137,13 +145,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Audit advisories
+      - name: Verify audit configuration
+        shell: bash
+        run: |
+          if [[ ! -f deny.toml ]]; then
+            echo "::error::deny.toml not found"
+            exit 1
+          fi
+
+          echo "Audit configuration found"
+
+      - name: Audit security advisories
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
-          arguments: --all-features
+          arguments: --config deny.toml --all-features
 
-  # Dependency policy audit
+  # ============================================
+  # Dependency Audit - Licenses / Bans / Sources
+  # ============================================
   dependencies:
     name: Dependency Audit
     runs-on: ubuntu-24.04
@@ -154,8 +174,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify audit configuration
+        shell: bash
+        run: |
+          if [[ ! -f deny.toml ]]; then
+            echo "::error::deny.toml not found"
+            exit 1
+          fi
+
+          echo "Audit configuration found"
+
       - name: Audit dependencies
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources
-          arguments: --all-features
+          arguments: --config deny.toml --all-features
