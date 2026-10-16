@@ -1,4 +1,8 @@
 fn main() {
+    println!(
+        "cargo:rustc-env=PLUM_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
     println!("cargo:rerun-if-changed=windows/rime-install.manifest");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())

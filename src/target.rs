@@ -30,6 +30,7 @@ pub struct PackageListRef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackageRef {
+    pub identity: String,
     /// GitHub user，默认 "rime"
     pub user: String,
     /// 原始 GitHub 项目名（如果包含 rime- 则保留）
@@ -93,8 +94,19 @@ pub fn parse_target(s: &str) -> Result<Target, ParseError> {
             .strip_prefix("https://github.com/")
             .unwrap()
             .trim_end_matches('/');
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        return Ok(Target::Package(parse_package_ref(path)?));
+        if let Some((repo, branch)) = path.split_once("/tree/") {
+            return Ok(Target::Package(parse_package_ref(&format!(
+                "{repo}@{branch}"
+            ))?));
+        }
+        let boundary = path.find(['@', ':']).unwrap_or(path.len());
+        let base = path[..boundary]
+            .strip_suffix(".git")
+            .unwrap_or(&path[..boundary]);
+        return Ok(Target::Package(parse_package_ref(&format!(
+            "{base}{}",
+            &path[boundary..]
+        ))?));
     }
     if s.ends_with(".conf") && std::path::Path::new(s).is_file() {
         return Ok(Target::LocalConfig(s.into()));
@@ -203,6 +215,7 @@ fn parse_package_ref(s: &str) -> Result<PackageRef, ParseError> {
         return Err(ParseError::Unrecognized(s.into()));
     }
     Ok(PackageRef {
+        identity: pkg_part.into(),
         user,
         repo,
         project,

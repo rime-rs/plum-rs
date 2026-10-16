@@ -34,12 +34,19 @@ pub fn unpack<R: Read + Seek>(reader: R, directory: &Path) -> Result<PathBuf> {
             }
         }
     }
-    let entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    let entries = fs::read_dir(directory)?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|e| {
+            !e.file_name().to_string_lossy().starts_with('.') && e.file_name() != "__MACOSX"
+        })
+        .collect::<Vec<_>>();
     if entries.len() == 1
         && entries[0].file_type()?.is_dir()
-        && std::fs::read_dir(entries[0].path())?
-            .filter_map(Result::ok)
-            .any(|e| e.path().extension().is_some_and(|ext| ext == "yaml"))
+        && !matches!(
+            entries[0].file_name().to_str(),
+            Some("opencc" | "lua" | "dict" | "dicts" | "build" | "schemas")
+        )
     {
         Ok(entries[0].path())
     } else {
@@ -47,7 +54,13 @@ pub fn unpack<R: Read + Seek>(reader: R, directory: &Path) -> Result<PathBuf> {
     }
 }
 
-pub fn install(source: &str, plum: &Path, output: &Path, no_update: bool) -> Result<usize> {
+pub fn install(
+    source: &str,
+    plum: &Path,
+    output: &Path,
+    no_update: bool,
+    recursive: bool,
+) -> Result<usize> {
     fs::create_dir_all(plum)?;
     let temp = tempfile::tempdir_in(plum)?;
     let root = if source.starts_with("https://") || source.starts_with("http://") {
@@ -67,6 +80,8 @@ pub fn install(source: &str, plum: &Path, output: &Path, no_update: bool) -> Res
     let recipe = root.join("recipe.yaml");
     if recipe.is_file() {
         crate::recipe::install_recipe(&recipe, &root, output, &[], no_update)
+    } else if recursive {
+        crate::recipe::install_recursive_files(&root, output)
     } else {
         crate::recipe::install_default_files(&root, output)
     }
@@ -90,5 +105,16 @@ mod tests {
         assert!(root.join("a.yaml").is_file());
         assert!(unpack(archive("../escape.yaml"), dir.path()).is_err());
         assert!(unpack(archive("C:/escape.yaml"), dir.path()).is_err());
+    }
+    #[test]
+    fn unwraps_lua_only_repositories_but_preserves_data_directories() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = unpack(archive("repo-main/lua/tool.lua"), repo.path()).unwrap();
+        assert!(root.join("lua/tool.lua").is_file());
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unpack(archive("opencc/data.json"), data.path()).unwrap(),
+            data.path()
+        );
     }
 }

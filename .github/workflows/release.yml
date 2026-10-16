@@ -293,6 +293,8 @@ jobs:
           cp LICENSE dist/LICENSE.txt
           cp README.md dist/README.md
           cp windows/rime-install.bat dist/rime-install.bat
+          cp vendor/plum/LICENSE dist/UPSTREAM-LICENSE.txt
+          cp vendor/plum/SOURCE.txt dist/UPSTREAM-SOURCE.txt
           printf 'Source: %s/%s/tree/%s\nArchive: %s/%s/archive/refs/tags/%s.tar.gz\n' \
             '${{ github.server_url }}' '${{ github.repository }}' '${{ github.event.release.tag_name }}' \
             '${{ github.server_url }}' '${{ github.repository }}' '${{ github.event.release.tag_name }}' \
@@ -303,7 +305,7 @@ jobs:
         shell: bash
         working-directory: dist
         run: |
-          sha256sum rime-install-* rime-install.bat LICENSE.txt README.md SOURCE.txt > SHA256SUMS.txt
+          sha256sum rime-install-* rime-install.bat LICENSE.txt README.md SOURCE.txt UPSTREAM-LICENSE.txt UPSTREAM-SOURCE.txt > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Publish to existing GitHub Release

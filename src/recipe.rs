@@ -44,12 +44,23 @@ fn expand(
     options: &HashMap<String, String>,
     used: &mut HashSet<String>,
 ) -> Result<String> {
-    if text.contains('`') || text.contains("$(") {
-        bail!("不支持 recipe 中的 Shell 命令执行");
-    }
     let mut out = String::new();
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\\'
+            && chars
+                .peek()
+                .is_some_and(|c| matches!(c, '\\' | '$' | '`' | '\n'))
+        {
+            let next = chars.next().unwrap();
+            if next != '\n' {
+                out.push(next);
+            }
+            continue;
+        }
+        if c == '`' || (c == '$' && chars.peek() == Some(&'(')) {
+            bail!("Shell 命令替换需要 --shell-compat");
+        }
         if c != '$' {
             out.push(c);
             continue;
@@ -94,48 +105,11 @@ fn expand(
             .filter(|v| default.is_none() || !v.is_empty())
             .map(String::as_str)
             .or(default)
-            .with_context(|| format!("recipe 选项未提供: {key}"))?;
+            .unwrap_or("");
         used.insert(key.into());
         out.push_str(value);
     }
     Ok(out)
-}
-
-fn expand_value(
-    value: Value,
-    options: &HashMap<String, String>,
-    used: &mut HashSet<String>,
-) -> Result<Value> {
-    Ok(match value {
-        Value::String(s) => {
-            let expanded = expand(&s, options, used)?;
-            if s.starts_with('$') && !s[1..].contains('$') && expanded != s {
-                match from_str::<Value>(&expanded) {
-                    Ok(value @ (Value::Number(_) | Value::Bool(_) | Value::Null)) => value,
-                    _ => Value::String(expanded),
-                }
-            } else {
-                Value::String(expanded)
-            }
-        }
-        Value::Sequence(v) => Value::Sequence(
-            v.into_iter()
-                .map(|v| expand_value(v, options, used))
-                .collect::<Result<_>>()?,
-        ),
-        Value::Mapping(m) => {
-            let mut output = yaml_serde::Mapping::new();
-            for (k, v) in m {
-                output.insert(
-                    expand_value(k, options, used)?,
-                    expand_value(v, options, used)?,
-                );
-            }
-            Value::Mapping(output)
-        }
-        Value::Tagged(_) => bail!("不支持 recipe 补丁中的 YAML 标签"),
-        v => v,
-    })
 }
 
 pub fn install_recipe(
@@ -143,23 +117,54 @@ pub fn install_recipe(
     package: &Path,
     output: &Path,
     options: &[(String, String)],
-    no_update: bool,
+    _no_update: bool,
+) -> Result<usize> {
+    let identity = package
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("package");
+    install_named_recipe(file, package, output, options, identity)
+}
+
+pub fn install_named_recipe(
+    file: &Path,
+    package: &Path,
+    output: &Path,
+    options: &[(String, String)],
+    package_id: &str,
 ) -> Result<usize> {
     let recipe = load_recipe(file)?;
     if recipe.patch.is_some() {
         bail!("不支持 recipe.patch；请使用 patch_files: 文件名: 补丁映射");
     }
-    if let Some(info) = &recipe.recipe
-        && let Some(rx) = info.get("Rx").and_then(Value::as_str)
-        && let Some(stem) = file
-            .file_name()
+    if let Some(stem) = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_suffix(".recipe.yaml"))
+        && recipe
+            .recipe
+            .as_ref()
+            .and_then(|info| info.get("Rx"))
+            .and_then(Value::as_str)
+            != Some(stem)
+    {
+        bail!("recipe.Rx 缺失或与文件名 '{stem}' 不一致");
+    }
+    let content = std::fs::read_to_string(file)?;
+    let mut vars: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    vars.insert("package".into(), package_id.into());
+    vars.insert(
+        "recipe".into(),
+        file.file_name()
             .and_then(|s| s.to_str())
             .and_then(|s| s.strip_suffix(".recipe.yaml"))
-        && rx != stem
-    {
-        bail!("recipe.Rx '{rx}' 与文件名 '{stem}' 不一致");
-    }
-    let vars: HashMap<_, _> = options.iter().cloned().collect();
+            .unwrap_or("")
+            .into(),
+    );
+    vars.insert("output_dir".into(), output.to_string_lossy().into_owned());
+    vars.extend(options.iter().cloned());
     let mut used = HashSet::new();
     let mut downloads = Vec::new();
     for spec in recipe
@@ -197,20 +202,26 @@ pub fn install_recipe(
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
+    let templates = crate::patch::bodies(&content)?;
     let mut patches = BTreeMap::new();
     for (name, patch) in recipe.patch_files.unwrap_or_default() {
-        let name = expand(&name, &vars, &mut used)?;
-        safe_join(output, &name)?;
-        let patch = expand_value(patch, &vars, &mut used)?;
-        if !patch.is_mapping() {
-            bail!("patch_files.{name} 必须是 YAML 映射；不支持 Shell 脚本");
+        let expanded_name = expand(&name, &vars, &mut used)?;
+        safe_join(output, &expanded_name)?;
+        let body = if let Some(body) = templates.get(&name) {
+            body.clone()
+        } else {
+            yaml_serde::to_string(&patch)?
+                .lines()
+                .map(|s| format!("  {s}\n"))
+                .collect()
+        };
+        let body = expand(&body, &vars, &mut used)?;
+        let value: Value =
+            from_str(&body).context("补丁不是有效 YAML；需要 Shell 的配方请使用 --shell-compat")?;
+        if !value.is_mapping() && !value.is_sequence() && !value.is_null() {
+            bail!("patch_files.{name} 必须是映射或序列");
         }
-        patches.insert(name, patch);
-    }
-    for (key, _) in options {
-        if !used.contains(key) {
-            bail!("未使用的 recipe 选项: {key}");
-        }
+        patches.insert(expanded_name, body);
     }
     // Validate all declarations before network or installation side effects.
     if let Some(patterns) = &patterns {
@@ -221,22 +232,10 @@ pub fn install_recipe(
     }
     for (name, url) in downloads {
         let path = safe_join(package, &name)?;
-        if no_update && path.is_file() {
-            continue;
-        }
-        println!("下载文件: {url}");
-        let bytes = ureq::get(&url)
-            .call()?
-            .into_body()
-            .with_config()
-            .limit(128 * 1024 * 1024)
-            .read_to_vec()?;
-        crate::files::atomic_write(&path, &bytes)?;
+        println!("检查外部文件更新: {url}");
+        crate::download::download(&url, &path)?;
     }
-    let patterns = match patterns {
-        Some(p) => p,
-        None => collect_default_files(package)?,
-    };
+    let patterns = patterns.unwrap_or_default();
     let mut files = collect_files(&patterns, package)?;
     for (name, patch) in patches {
         let existing = if let Some(bytes) = files.get(&name) {
@@ -248,28 +247,22 @@ pub fn install_recipe(
                 Err(e) => return Err(e.into()),
             }
         };
-        let mut document: Value = match existing {
-            Some(b) => {
-                yaml_serde::from_slice(&b).with_context(|| format!("补丁目标不是 YAML: {name}"))?
-            }
-            None => Value::Mapping(Default::default()),
-        };
-        let mapping = document
-            .as_mapping_mut()
-            .context("补丁目标必须是 YAML 映射")?;
-        let key = Value::String("__patch".into());
-        if !mapping.contains_key(&key) {
-            mapping.insert(key.clone(), Value::Mapping(Default::default()));
-        }
-        let target = mapping
-            .get_mut(&key)
-            .unwrap()
-            .as_mapping_mut()
-            .context("现有 __patch 必须是 YAML 映射")?;
-        for (k, v) in patch.as_mapping().unwrap() {
-            target.insert(k.clone(), v.clone());
-        }
-        files.insert(name, yaml_serde::to_string(&document)?.into_bytes());
+        let original = String::from_utf8(existing.unwrap_or_default())?;
+        let recipe_name = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix(".recipe.yaml"))
+            .unwrap_or("");
+        let option_list = options
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let identity = format!("{package_id}:{recipe_name}:{option_list}");
+        files.insert(
+            name,
+            crate::patch::apply(&original, &patch, &identity)?.into_bytes(),
+        );
     }
     commit(output, files)
 }
@@ -277,11 +270,52 @@ pub fn install_recipe(
 pub fn install_default_files(package: &Path, output: &Path) -> Result<usize> {
     commit(
         output,
-        collect_files(&collect_default_files(package)?, package)?,
+        collect_named_files(&collect_default_files(package)?, package)?,
     )
 }
 
 fn collect_default_files(package: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(package)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (name.ends_with(".yaml")
+            && !name.ends_with(".custom.yaml")
+            && !name.ends_with(".recipe.yaml")
+            && name != "recipe.yaml")
+            || name.ends_with(".txt")
+            || name.ends_with(".gram")
+        {
+            files.push(name);
+        }
+    }
+    if package.join("opencc").is_dir() {
+        for entry in std::fs::read_dir(package.join("opencc"))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type()?.is_file()
+                && [".json", ".ocd", ".txt"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+            {
+                files.push(format!("opencc/{name}"));
+            }
+        }
+    }
+    Ok(files)
+}
+
+pub fn install_recursive_files(package: &Path, output: &Path) -> Result<usize> {
+    commit(
+        output,
+        collect_named_files(&collect_recursive_files(package)?, package)?,
+    )
+}
+
+fn collect_recursive_files(package: &Path) -> Result<Vec<String>> {
     fn visit(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -289,7 +323,7 @@ fn collect_default_files(package: &Path) -> Result<Vec<String>> {
             let name = entry.file_name().to_string_lossy().into_owned();
             if ty.is_symlink()
                 || name.starts_with('.')
-                || matches!(name.as_str(), "build" | "target")
+                || matches!(name.as_str(), "build" | "target" | "__MACOSX")
             {
                 continue;
             }
@@ -324,6 +358,13 @@ fn collect_default_files(package: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     visit(package, package, &mut files)?;
     Ok(files)
+}
+
+fn collect_named_files(names: &[String], package: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    names
+        .iter()
+        .map(|name| Ok((name.clone(), std::fs::read(safe_join(package, name)?)?)))
+        .collect()
 }
 
 fn collect_files(patterns: &[String], package: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -361,13 +402,26 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nschema: test").unwrap();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                if index == 0 {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\nContent-Length: 12\r\nConnection: close\r\n\r\nschema: test").unwrap();
+                } else {
+                    assert!(
+                        String::from_utf8_lossy(&request[..length])
+                            .to_lowercase()
+                            .contains("if-modified-since: wed, 01 jan 2020")
+                    );
+                    stream
+                        .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                }
+            }
         });
         let pkg = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -377,7 +431,6 @@ mod tests {
             install_recipe(&file, pkg.path(), out.path(), &[], false).unwrap(),
             1
         );
-        server.join().unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("nested/a.yaml")).unwrap(),
             "schema: test"
@@ -386,6 +439,7 @@ mod tests {
             install_recipe(&file, pkg.path(), out.path(), &[], true).unwrap(),
             0
         );
+        server.join().unwrap();
     }
     #[test]
     fn patch_options_and_idempotence() {
@@ -441,7 +495,8 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, "test").unwrap();
         }
-        assert_eq!(install_default_files(pkg.path(), out.path()).unwrap(), 4);
+        assert_eq!(install_default_files(pkg.path(), out.path()).unwrap(), 1);
+        assert_eq!(install_recursive_files(pkg.path(), out.path()).unwrap(), 3);
         assert!(collect_files(&["absent.yaml".into()], pkg.path()).is_err());
     }
     #[test]
@@ -452,14 +507,11 @@ mod tests {
             expand("$name ${other:-default}", &vars, &mut used).unwrap(),
             "Alice default"
         );
-        assert!(expand("${missing}", &vars, &mut used).is_err());
+        assert_eq!(expand("${missing}", &vars, &mut used).unwrap(), "");
         assert_eq!(
             expand("derive/x$/y/", &vars, &mut used).unwrap(),
             "derive/x$/y/"
         );
-        assert_eq!(
-            expand_value(Value::String("${size:-9}".into()), &vars, &mut used).unwrap(),
-            Value::Number(9.into())
-        );
+        assert_eq!(expand("${size:-9}", &vars, &mut used).unwrap(), "9");
     }
 }

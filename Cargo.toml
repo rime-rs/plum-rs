@@ -24,6 +24,10 @@ yaml_serde = "0.10.7"
 zip = {version = "9.0.3", default-features = false, features = ["deflate"]}
 tempfile = "3"
 url = "2"
+httpdate = "1.0.3"
+sha2 = "0.11.0"
+tar = "0.4.46"
+flate2 = "1.1.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"

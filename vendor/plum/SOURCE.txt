@@ -1,0 +1,4 @@
+Source: https://github.com/rime/plum
+Commit: b1be1969f914cc005add4090631b855db00c2591
+The scripts are unmodified upstream sources, embedded only for explicit --shell-compat mode and differential tests.
+License: LGPL-3.0 (see LICENSE).

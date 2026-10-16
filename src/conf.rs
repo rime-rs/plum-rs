@@ -177,24 +177,28 @@ fn expand(
             Statement::Append(values) => result.extend(values),
             Statement::Source(name) => {
                 let mut name = name;
+                let mut rooted = false;
                 for prefix in ["${root_dir:-.}/", "${root_dir}/", "$root_dir/"] {
                     if let Some(tail) = name.strip_prefix(prefix) {
                         name = tail.into();
+                        rooted = true;
                         break;
                     }
                 }
                 if name.contains(['$', '`']) {
                     bail!("不支持 source 表达式: {name}");
                 }
-                let next = if remote {
-                    url::Url::parse(location)?.join(&name)?.to_string()
-                } else if location.starts_with("builtin:") {
-                    crate::files::safe_join(plum_dir, &name)?;
-                    format!("builtin:{name}")
+                let next = if rooted {
+                    let local = plum_dir.join(&name);
+                    if !local.exists() && builtin(&name).is_some() {
+                        format!("builtin:{name}")
+                    } else {
+                        std::path::absolute(local)?.to_string_lossy().into_owned()
+                    }
                 } else {
-                    crate::files::safe_join(path.parent().unwrap_or(Path::new(".")), &name)?
-                        .to_string_lossy()
-                        .into_owned()
+                    // Bash source resolves ordinary paths against the caller's cwd,
+                    // not the directory or URL of the containing manifest.
+                    std::path::absolute(&name)?.to_string_lossy().into_owned()
                 };
                 expand(&next, plum_dir, stack, result)?;
             }
@@ -231,7 +235,7 @@ mod tests {
         let all = load("builtin:all-packages.conf", dir.path()).unwrap();
         assert_eq!(all[0], "one");
         assert!(all.contains(&"wubi".into()));
-        std::fs::write(dir.path().join("a.conf"), "source a.conf").unwrap();
+        std::fs::write(dir.path().join("a.conf"), "source \"${root_dir}/a.conf\"").unwrap();
         assert!(load(dir.path().join("a.conf").to_str().unwrap(), dir.path()).is_err());
     }
 }
