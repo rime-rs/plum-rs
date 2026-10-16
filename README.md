@@ -15,7 +15,9 @@ rime-install user/repo:recipe:option=value
 rime-install --select :all
 ```
 
-无参数默认安装 `:preset`，与原版 Bash 入口一致。`--select` 显示编号菜单，可输入包名、`clear` 重选、`.` 完成、`quit` 取消。`--interactive` 是额外的循环输入模式；空行安装 `:preset`，`q` 退出。
+无参数运行仅显示帮助并退出，不联网、不下载、不修改配置。只指定目录、`--no-update` 或 `--shell-compat` 等选项而未指定目标或操作时，也只显示帮助。安装预设包需显式运行 `rime-install :preset`。
+
+`--select` 显示编号菜单（未指定候选目标时使用 `:preset`），可输入包名、`clear` 重选、`.` 完成、`quit` 取消。`--interactive` 是额外的循环输入模式；空行安装 `:preset`，`q` 退出。
 
 ## 目录与缓存
 

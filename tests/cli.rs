@@ -44,7 +44,7 @@ fn legacy_environment_variables() {
     assert!(out.join("luna-pinyin.schema.yaml").is_file());
 }
 #[test]
-fn original_style_all_and_default_preset_in_unicode_paths() {
+fn original_style_all_and_explicit_preset_in_unicode_paths() {
     let temp = tempfile::tempdir().unwrap();
     let plum = temp.path().join("缓存 plum");
     let output = temp.path().join("输出 Rime");
@@ -71,6 +71,7 @@ fn original_style_all_and_default_preset_in_unicode_paths() {
     assert!(output.join("terra-pinyin.schema.yaml").is_file());
     let other = temp.path().join("default");
     let result = command(&plum, &other)
+        .arg(":preset")
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -81,6 +82,41 @@ fn original_style_all_and_default_preset_in_unicode_paths() {
     );
     assert!(other.join("luna-pinyin.schema.yaml").is_file());
     assert!(!other.join("terra-pinyin.schema.yaml").exists());
+}
+#[test]
+fn no_target_shows_help_without_touching_config_or_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let plum = temp.path().join("cache");
+    let output = temp.path().join("rime");
+    fs::create_dir_all(&output).unwrap();
+    let config = output.join("default.custom.yaml");
+    fs::write(&config, "patch:\n  menu/page_size: 7\n").unwrap();
+    for args in [
+        vec![],
+        vec!["--no-update"],
+        vec!["--shell-compat"],
+        vec!["--recursive"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_rime-install"))
+            .env("RIME_DIR", &output)
+            .env("PLUM_DIR", &plum)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{:?}", result);
+        assert!(String::from_utf8_lossy(&result.stdout).contains("--help"));
+        assert!(!plum.exists());
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "patch:\n  menu/page_size: 7\n"
+        );
+        assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    }
+    let result = command(&plum, &output).output().unwrap();
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("--help"));
+    assert!(!plum.exists());
 }
 #[test]
 fn zip_and_recipe_options_and_failure_status() {

@@ -13,7 +13,7 @@ mod self_update;
 mod target;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -42,7 +42,7 @@ struct Cli {
     /// 按原版菜单选择要安装的包
     #[arg(long, conflicts_with = "interactive")]
     select: bool,
-    /// 循环读取安装目标（无参数默认直接安装 :preset）
+    /// 循环读取安装目标
     #[arg(long)]
     interactive: bool,
     /// 扩展默认规则，递归安装 Lua、嵌套词库等；配方中的 install_files 仍优先
@@ -73,6 +73,19 @@ struct Cli {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.targets.is_empty()
+        && !cli.select
+        && !cli.interactive
+        && cli.build.is_none()
+        && !cli.compile
+        && cli.install_shared.is_none()
+        && cli.dist.is_none()
+        && !cli.clean_output
+    {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
     if cli.rime_dir.is_none() {
         cli.rime_dir = std::env::var_os("rime_dir").map(PathBuf::from);
     }
